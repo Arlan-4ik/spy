@@ -1,10 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
 
 import {
+  addDoc,
   collection,
   deleteDoc,
   doc,
-  getDoc,
   getDocs,
   onSnapshot,
   query,
@@ -16,32 +16,24 @@ import {
 
 import { db, firebaseConfigured } from "./firebase";
 
-import { LOCATIONS, ITEMS, randomCode, pick, randomRoundType } from "./game";
+import { LOCATIONS, ITEMS, randomCode, pick } from "./game";
 
 const LS = "spy-night-player";
 
-// ========================================
-// LOCAL STORAGE
-// ========================================
-
-const load = () => {
+function loadPlayer() {
   try {
     return JSON.parse(localStorage.getItem(LS)) || {};
   } catch {
     return {};
   }
-};
+}
 
-const save = (data) => {
+function savePlayer(data) {
   localStorage.setItem(LS, JSON.stringify(data));
-};
-
-// ========================================
-// APP
-// ========================================
+}
 
 export default function App() {
-  const [me, setMe] = useState(load());
+  const [me, setMe] = useState(loadPlayer());
 
   const [room, setRoom] = useState(null);
   const [players, setPlayers] = useState([]);
@@ -51,33 +43,29 @@ export default function App() {
   const [view, setView] = useState("home");
 
   const [name, setName] = useState(me.name || "");
-
   const [code, setCode] = useState("");
 
   const [error, setError] = useState("");
-
   const [selected, setSelected] = useState("");
 
   const [loading, setLoading] = useState(false);
 
-  const [hasVoted, setHasVoted] = useState(false);
+  const [showInfo, setShowInfo] = useState(true);
 
-  const [kicked, setKicked] = useState(false);
-
-  // ========================================
-  // ROOM LISTENER
-  // ========================================
+  /* =========================================
+     ROOM LISTENER
+  ========================================= */
 
   useEffect(() => {
     if (!me.roomId) return;
 
     const roomRef = doc(db, "rooms", me.roomId);
 
-    const unsubRoom = onSnapshot(
+    const unsubscribeRoom = onSnapshot(
       roomRef,
       (snapshot) => {
         if (!snapshot.exists()) {
-          setError("Комната не найдена.");
+          setError("Комната больше не существует.");
           return;
         }
 
@@ -88,15 +76,20 @@ export default function App() {
 
         setRoom(data);
 
+        /*
+          ВАЖНО:
+          Роль больше не исчезает при переходе
+          discussion / voting.
+
+          Информация игрока находится отдельно
+          в карточке справа.
+        */
+
         if (data.phase === "lobby") {
           setView("lobby");
         }
 
-        if (data.phase === "roles") {
-          setView("role");
-        }
-
-        if (data.phase === "discussion") {
+        if (data.phase === "roles" || data.phase === "discussion") {
           setView("discussion");
         }
 
@@ -108,110 +101,72 @@ export default function App() {
           setView("result");
         }
       },
-      (err) => {
-        setError(err.message);
+      (error) => {
+        setError(error.message);
       },
     );
 
-    // PLAYERS
     const playersQuery = query(collection(db, "rooms", me.roomId, "players"));
 
-    const unsubPlayers = onSnapshot(playersQuery, (snapshot) => {
-      const list = snapshot.docs.map((d) => ({
-        id: d.id,
-        ...d.data(),
-      }));
-
-      setPlayers(list);
-
-      const stillHere = list.some((player) => player.uid === me.uid);
-
-      if (me.uid && !stillHere) {
-        setKicked(true);
-
-        localStorage.removeItem(LS);
-      }
+    const unsubscribePlayers = onSnapshot(playersQuery, (snapshot) => {
+      setPlayers(
+        snapshot.docs.map((item) => ({
+          id: item.id,
+          ...item.data(),
+        })),
+      );
     });
 
     return () => {
-      unsubRoom();
-      unsubPlayers();
+      unsubscribeRoom();
+      unsubscribePlayers();
     };
-  }, [me.roomId, me.uid]);
+  }, [me.roomId]);
 
-  // ========================================
-  // PRIVATE ROLE
-  // ========================================
+  /* =========================================
+     PRIVATE ROLE LISTENER
+  ========================================= */
 
   useEffect(() => {
-    if (!me.roomId || !me.uid) {
-      return;
-    }
+    if (!me.roomId || !me.uid) return;
 
     const roleRef = doc(db, "rooms", me.roomId, "privateRoles", me.uid);
 
-    const unsub = onSnapshot(roleRef, (snapshot) => {
+    const unsubscribe = onSnapshot(roleRef, (snapshot) => {
       if (snapshot.exists()) {
         setRole(snapshot.data());
       }
     });
 
-    return unsub;
+    return unsubscribe;
   }, [me.roomId, me.uid]);
 
-  // ========================================
-  // CHECK VOTE
-  // ========================================
-
-  useEffect(() => {
-    async function checkVote() {
-      if (!me.roomId || !me.uid) {
-        return;
-      }
-
-      try {
-        const voteRef = doc(db, "rooms", me.roomId, "votes", me.uid);
-
-        const snapshot = await getDoc(voteRef);
-
-        if (snapshot.exists() && snapshot.data()?.votedFor) {
-          setHasVoted(true);
-        } else {
-          setHasVoted(false);
-        }
-      } catch (err) {
-        console.error(err);
-      }
-    }
-
-    checkVote();
-  }, [me.roomId, me.uid, view]);
-
-  // ========================================
-  // HOST
-  // ========================================
+  /* =========================================
+     HELPERS
+  ========================================= */
 
   const host = room?.hostId === me.uid;
 
-  // ========================================
-  // SORT PLAYERS
-  // ========================================
-
-  const sorted = useMemo(() => {
+  const sortedPlayers = useMemo(() => {
     return [...players].sort(
       (a, b) => (a.joinedAt?.seconds || 0) - (b.joinedAt?.seconds || 0),
     );
   }, [players]);
 
-  // ========================================
-  // CREATE ROOM
-  // ========================================
+  function clearError() {
+    setError("");
+  }
+
+  /* =========================================
+     CREATE ROOM
+  ========================================= */
 
   async function createRoom() {
     setError("");
 
     if (!name.trim()) {
-      return setError("Сначала введи ник.");
+      setError("Сначала введи свой ник.");
+      return;
     }
 
     setLoading(true);
@@ -232,17 +187,17 @@ export default function App() {
 
         round: 1,
 
-        createdAt: serverTimestamp(),
+        location: null,
 
-        roundType: null,
-
-        answer: null,
+        item: null,
 
         spyId: null,
 
         caught: null,
 
         winnerId: null,
+
+        createdAt: serverTimestamp(),
       });
 
       await setDoc(doc(roomRef, "players", uid), {
@@ -257,57 +212,53 @@ export default function App() {
 
       const identity = {
         uid,
-
         name: name.trim(),
-
         roomId: roomRef.id,
-
         code: roomCode,
       };
 
-      save(identity);
+      savePlayer(identity);
 
       setMe(identity);
 
       setView("lobby");
-    } catch (err) {
-      setError(err.message);
+    } catch (error) {
+      setError(error.message);
     } finally {
       setLoading(false);
     }
   }
 
-  // ========================================
-  // JOIN ROOM
-  // ========================================
+  /* =========================================
+     JOIN ROOM
+  ========================================= */
 
   async function joinRoom() {
     setError("");
 
     if (!name.trim() || !code.trim()) {
-      return setError("Введи ник и код.");
+      setError("Введи ник и код комнаты.");
+      return;
     }
 
     setLoading(true);
 
     try {
-      const snapshot = await getDocs(
-        query(
-          collection(db, "rooms"),
-          where("code", "==", code.trim().toUpperCase()),
-        ),
+      const roomsQuery = query(
+        collection(db, "rooms"),
+        where("code", "==", code.trim().toUpperCase()),
       );
 
+      const snapshot = await getDocs(roomsQuery);
+
       if (snapshot.empty) {
-        throw Error("Комната с таким кодом не найдена.");
+        throw new Error("Комната с таким кодом не найдена.");
       }
 
       const roomDoc = snapshot.docs[0];
 
-      const roomData = roomDoc.data();
-
-      if (roomData.phase !== "lobby") {
-        throw Error("Игра уже началась. Дождись следующего раунда.");
+      if (roomDoc.data().phase !== "lobby") {
+        throw new Error("Игра уже началась. Подключиться нельзя.");
       }
 
       const uid = crypto.randomUUID();
@@ -329,48 +280,60 @@ export default function App() {
 
         roomId: roomDoc.id,
 
-        code: roomData.code,
+        code: roomDoc.data().code,
       };
 
-      save(identity);
+      savePlayer(identity);
 
       setMe(identity);
 
       setView("lobby");
-    } catch (err) {
-      setError(err.message);
+    } catch (error) {
+      setError(error.message);
     } finally {
       setLoading(false);
     }
   }
 
-  // ========================================
-  // START GAME
-  // ========================================
+  /* =========================================
+     START ROUND
+  ========================================= */
 
   async function startGame() {
     if (!host) return;
 
     if (players.length < 3) {
-      return setError("Нужно минимум 3 игрока.");
+      setError("Для начала игры нужно минимум 3 игрока.");
+      return;
     }
 
+    setLoading(true);
+
     try {
-      setLoading(true);
+      /*
+        Рандомная локация
+      */
 
-      // Выбираем тип раунда
-      const roundType = randomRoundType();
+      const location = pick(LOCATIONS);
 
-      // Выбираем ответ
-      const answer = roundType === "location" ? pick(LOCATIONS) : pick(ITEMS);
+      /*
+        Рандомный предмет
+      */
 
-      // Выбираем шпиона
+      const item = pick(ITEMS);
+
+      /*
+        Рандомный шпион
+      */
+
       const spy = pick(players);
 
-      // Создаём приватные роли
-      const promises = [];
+      /*
+        Каждому игроку выдаём
+        персональную информацию
+      */
 
-      for (const player of players) {
+      const promises = players.map((player) => {
         const privateRef = doc(
           db,
           "rooms",
@@ -379,35 +342,62 @@ export default function App() {
           player.uid,
         );
 
-        const data =
-          player.uid === spy.uid
-            ? {
-                isSpy: true,
+        /*
+          Шпион:
+          знает что он шпион,
+          но НЕ знает локацию и предмет.
+        */
 
-                roundType,
+        if (player.uid === spy.uid) {
+          return setDoc(privateRef, {
+            isSpy: true,
 
-                answer: null,
-              }
-            : {
-                isSpy: false,
+            location: null,
 
-                roundType,
+            item: null,
 
-                answer,
-              };
+            round: room?.round || 1,
+          });
+        }
 
-        promises.push(setDoc(privateRef, data));
-      }
+        /*
+          Мирный:
+          знает локацию и предмет.
+        */
+
+        return setDoc(privateRef, {
+          isSpy: false,
+
+          location,
+
+          item,
+
+          round: room?.round || 1,
+        });
+      });
 
       await Promise.all(promises);
 
-      // Обновляем комнату
+      /*
+        Очищаем старые голоса
+      */
+
+      const votesSnapshot = await getDocs(
+        collection(db, "rooms", me.roomId, "votes"),
+      );
+
+      await Promise.all(votesSnapshot.docs.map((vote) => deleteDoc(vote.ref)));
+
+      /*
+        Запускаем раунд
+      */
+
       await updateDoc(doc(db, "rooms", me.roomId), {
         phase: "roles",
 
-        roundType,
+        location,
 
-        answer,
+        item,
 
         spyId: spy.uid,
 
@@ -416,174 +406,203 @@ export default function App() {
         winnerId: null,
       });
 
-      setHasVoted(false);
-    } catch (err) {
-      setError(err.message);
+      setSelected("");
+
+      setShowInfo(true);
+    } catch (error) {
+      setError(error.message);
     } finally {
       setLoading(false);
     }
   }
 
-  // ========================================
-  // GO DISCUSSION
-  // ========================================
+  /* =========================================
+     GO DISCUSSION
+  ========================================= */
 
   async function goDiscussion() {
-    if (!role) {
-      return setError("Роль ещё загружается.");
-    }
+    if (!host) return;
 
-    try {
-      await updateDoc(doc(db, "rooms", me.roomId), {
-        phase: "discussion",
-      });
-    } catch (err) {
-      setError(err.message);
-    }
+    await updateDoc(doc(db, "rooms", me.roomId), {
+      phase: "discussion",
+    });
   }
 
-  // ========================================
-  // GO VOTE
-  // ========================================
+  /* =========================================
+     GO VOTE
+  ========================================= */
 
   async function goVote() {
     if (!host) return;
 
-    try {
-      await updateDoc(doc(db, "rooms", me.roomId), {
-        phase: "voting",
-      });
-
-      setSelected("");
-
-      setHasVoted(false);
-    } catch (err) {
-      setError(err.message);
-    }
+    await updateDoc(doc(db, "rooms", me.roomId), {
+      phase: "voting",
+    });
   }
 
-  // ========================================
-  // VOTE
-  // ========================================
+  /* =========================================
+     VOTE
+  ========================================= */
 
   async function vote() {
-    if (!selected) return;
-
-    if (selected === me.uid) {
-      return setError("Нельзя голосовать за самого себя.");
+    if (!selected) {
+      setError("Сначала выбери игрока.");
+      return;
     }
 
-    if (hasVoted) {
-      return setError("Ты уже проголосовал.");
+    if (!room || room.phase !== "voting") {
+      return;
     }
+
+    setLoading(true);
 
     try {
-      setLoading(true);
-
       await setDoc(doc(db, "rooms", me.roomId, "votes", me.uid), {
         votedFor: selected,
 
-        votedAt: serverTimestamp(),
+        playerId: me.uid,
+
+        createdAt: serverTimestamp(),
       });
 
-      setHasVoted(true);
+      /*
+        Проверяем количество голосов
+      */
 
       const votesSnapshot = await getDocs(
         collection(db, "rooms", me.roomId, "votes"),
       );
 
-      if (votesSnapshot.size >= players.length) {
-        const counts = {};
+      /*
+        Пока проголосовали не все —
+        ничего не заканчиваем.
+      */
 
-        votesSnapshot.forEach((voteDoc) => {
-          const votedFor = voteDoc.data().votedFor;
-
-          if (!votedFor) return;
-
-          counts[votedFor] = (counts[votedFor] || 0) + 1;
-        });
-
-        const sortedVotes = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-
-        if (!sortedVotes.length) {
-          return;
-        }
-
-        const winner = sortedVotes[0][0];
-
-        const found = winner === room.spyId;
-
-        // Очки
-        for (const player of players) {
-          let add = 0;
-
-          // Мирные нашли шпиона
-          if (found && player.uid !== room.spyId) {
-            add = 2;
-          }
-
-          // Шпион остался незамеченным
-          if (!found && player.uid === room.spyId) {
-            add = 3;
-          }
-
-          if (add) {
-            await updateDoc(
-              doc(db, "rooms", me.roomId, "players", player.uid),
-              {
-                score: (player.score || 0) + add,
-              },
-            );
-          }
-        }
-
-        await updateDoc(doc(db, "rooms", me.roomId), {
-          phase: "results",
-
-          caught: found,
-
-          winnerId: winner,
-        });
+      if (votesSnapshot.size < players.length) {
+        setLoading(false);
+        return;
       }
-    } catch (err) {
-      setError(err.message);
+
+      /*
+        Считаем голоса
+      */
+
+      const counts = {};
+
+      votesSnapshot.forEach((voteDoc) => {
+        const votedFor = voteDoc.data().votedFor;
+
+        if (!votedFor) return;
+
+        counts[votedFor] = (counts[votedFor] || 0) + 1;
+      });
+
+      const sortedVotes = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+
+      if (!sortedVotes.length) {
+        setLoading(false);
+        return;
+      }
+
+      /*
+        Игрок с максимальным количеством
+        голосов
+      */
+
+      const winnerId = sortedVotes[0][0];
+
+      const found = winnerId === room.spyId;
+
+      /*
+        Начисляем очки
+      */
+
+      for (const player of players) {
+        let points = 0;
+
+        /*
+          Мирные нашли шпиона
+        */
+
+        if (found && player.uid !== room.spyId) {
+          points = 2;
+        }
+
+        /*
+          Шпион победил
+        */
+
+        if (!found && player.uid === room.spyId) {
+          points = 3;
+        }
+
+        if (points > 0) {
+          await updateDoc(doc(db, "rooms", me.roomId, "players", player.uid), {
+            score: (player.score || 0) + points,
+          });
+        }
+      }
+
+      /*
+        Показываем результат
+      */
+
+      await updateDoc(doc(db, "rooms", me.roomId), {
+        phase: "results",
+
+        caught: found,
+
+        winnerId,
+      });
+    } catch (error) {
+      setError(error.message);
     } finally {
       setLoading(false);
     }
   }
 
-  // ========================================
-  // NEXT ROUND
-  // ========================================
+  /* =========================================
+     NEXT ROUND
+  ========================================= */
 
   async function nextRound() {
     if (!host) return;
 
+    setLoading(true);
+
     try {
-      const nextRound = (room.round || 1) + 1;
+      /*
+        Удаляем старые голоса
+      */
 
-      // Удаляем старые роли
-      const rolesSnapshot = await getDocs(
-        collection(db, "rooms", me.roomId, "privateRoles"),
-      );
-
-      await Promise.all(rolesSnapshot.docs.map((item) => deleteDoc(item.ref)));
-
-      // Удаляем старые голоса
       const votesSnapshot = await getDocs(
         collection(db, "rooms", me.roomId, "votes"),
       );
 
-      await Promise.all(votesSnapshot.docs.map((item) => deleteDoc(item.ref)));
+      await Promise.all(votesSnapshot.docs.map((vote) => deleteDoc(vote.ref)));
+
+      /*
+        Удаляем старые роли
+      */
+
+      const rolesSnapshot = await getDocs(
+        collection(db, "rooms", me.roomId, "privateRoles"),
+      );
+
+      await Promise.all(
+        rolesSnapshot.docs.map((roleDoc) => deleteDoc(roleDoc.ref)),
+      );
+
+      const next = (room?.round || 1) + 1;
 
       await updateDoc(doc(db, "rooms", me.roomId), {
         phase: "lobby",
 
-        round: nextRound,
+        round: next,
 
-        roundType: null,
+        location: null,
 
-        answer: null,
+        item: null,
 
         spyId: null,
 
@@ -596,132 +615,154 @@ export default function App() {
 
       setSelected("");
 
-      setHasVoted(false);
-    } catch (err) {
-      setError(err.message);
+      setShowInfo(true);
+    } catch (error) {
+      setError(error.message);
+    } finally {
+      setLoading(false);
     }
   }
 
-  // ========================================
-  // REMOVE PLAYER
-  // ========================================
+  /* =========================================
+     REMOVE PLAYER
+  ========================================= */
 
   async function removePlayer(player) {
     if (!host) return;
 
     if (player.uid === me.uid) {
-      return setError("Нельзя удалить самого себя.");
+      return;
     }
-
-    const confirmed = window.confirm(
-      `Удалить игрока "${player.name}" из комнаты?`,
-    );
-
-    if (!confirmed) return;
 
     try {
       await deleteDoc(doc(db, "rooms", me.roomId, "players", player.uid));
-
-      await deleteDoc(doc(db, "rooms", me.roomId, "privateRoles", player.uid));
-
-      await deleteDoc(doc(db, "rooms", me.roomId, "votes", player.uid));
-    } catch (err) {
-      setError(err.message);
+    } catch (error) {
+      setError(error.message);
     }
   }
 
-  // ========================================
-  // LEAVE
-  // ========================================
+  /* =========================================
+     LEAVE
+  ========================================= */
 
-  async function leave() {
-    const confirmed = window.confirm("Точно хочешь выйти из комнаты?");
+  function leave() {
+    localStorage.removeItem(LS);
 
-    if (!confirmed) return;
-
-    try {
-      if (me.roomId && me.uid && !host) {
-        await deleteDoc(doc(db, "rooms", me.roomId, "players", me.uid));
-      }
-
-      localStorage.removeItem(LS);
-
-      window.location.reload();
-    } catch (err) {
-      setError(err.message);
-    }
+    window.location.reload();
   }
 
-  // ========================================
-  // KICKED
-  // ========================================
+  /* =========================================
+     PLAYER INFO CARD
+  ========================================= */
 
-  if (kicked) {
+  function PlayerInfoCard() {
+    if (!role || view === "home" || view === "join" || view === "lobby") {
+      return null;
+    }
+
     return (
-      <div className="app">
-        <header>
-          <div className="logo">🕵️ SPY NIGHT</div>
-        </header>
+      <aside
+        className={"player-info " + (role.isSpy ? "spy-info" : "civilian-info")}
+      >
+        <div className="player-info-header">
+          <div>
+            <span className="info-mini">ТВОЯ ИНФОРМАЦИЯ</span>
 
-        <section className="card center">
-          <div className="big">🚫</div>
-
-          <span className="eyebrow">ДОСТУП ЗАКРЫТ</span>
-
-          <h2>Тебя удалили</h2>
-
-          <p>Ведущий удалил тебя из этой комнаты.</p>
+            <strong>{role.isSpy ? "🔴 ШПИОН" : "🟢 МИРНЫЙ"}</strong>
+          </div>
 
           <button
-            className="primary full"
-            onClick={() => {
-              localStorage.removeItem(LS);
-
-              window.location.reload();
-            }}
+            className="info-toggle"
+            onClick={() => setShowInfo((value) => !value)}
           >
-            Вернуться
+            {showInfo ? "−" : "+"}
           </button>
-        </section>
-      </div>
+        </div>
+
+        {showInfo && (
+          <div className="player-info-body">
+            {role.isSpy ? (
+              <>
+                <div className="spy-message">
+                  <span>🕵️</span>
+
+                  <div>
+                    <b>Ты — шпион</b>
+
+                    <small>
+                      Твоя задача — понять, где находятся остальные.
+                    </small>
+                  </div>
+                </div>
+
+                <div className="secret-value">
+                  <span>📍 ЛОКАЦИЯ</span>
+
+                  <b>???</b>
+                </div>
+
+                <div className="secret-value">
+                  <span>🎒 ПРЕДМЕТ</span>
+
+                  <b>???</b>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="info-value">
+                  <span>📍 ЛОКАЦИЯ</span>
+
+                  <b>{role.location || "—"}</b>
+                </div>
+
+                <div className="info-value">
+                  <span>🎒 ПРЕДМЕТ</span>
+
+                  <b>{role.item || "—"}</b>
+                </div>
+
+                <div className="private-label">🔒 Видно только тебе</div>
+              </>
+            )}
+          </div>
+        )}
+      </aside>
     );
   }
 
-  // ========================================
-  // FIREBASE SETUP
-  // ========================================
+  /* =========================================
+     FIREBASE SETUP
+  ========================================= */
 
   if (!firebaseConfigured) {
     return <Setup />;
   }
 
-  // ========================================
-  // MAIN
-  // ========================================
+  /* =========================================
+     UI
+  ========================================= */
 
   return (
     <div className="app">
-      {/* HEADER */}
-
       <header>
         <div className="logo">🕵️ SPY NIGHT</div>
 
         <div className="pill">REALTIME</div>
       </header>
 
-      {/* ERROR */}
-
       {error && (
         <div className="error">
           <span>{error}</span>
 
-          <button onClick={() => setError("")}>×</button>
+          <button onClick={clearError}>×</button>
         </div>
       )}
 
-      {/* =================================
+      <PlayerInfoCard />
+
+      {/* =====================================
           HOME
-      ================================= */}
+      ===================================== */}
 
       {view === "home" && (
         <section className="hero">
@@ -734,19 +775,20 @@ export default function App() {
           </h1>
 
           <p>
-            Заходите на сайт, а общайтесь в Discord. Роли, голосование и
-            результаты синхронизируются у всех игроков в реальном времени.
+            Заходите на сайт, получайте свою роль и информацию. После этого
+            переходим в Discord и пытаемся вычислить шпиона.
           </p>
 
           <input
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(event) => setName(event.target.value)}
             placeholder="Твой Discord-ник"
+            maxLength={24}
           />
 
           <div className="actions">
             <button className="primary" onClick={createRoom} disabled={loading}>
-              {loading ? "Создание..." : "Создать комнату"}
+              {loading ? "Создаём..." : "Создать комнату"}
             </button>
 
             <button className="secondary" onClick={() => setView("join")}>
@@ -756,9 +798,9 @@ export default function App() {
         </section>
       )}
 
-      {/* =================================
+      {/* =====================================
           JOIN
-      ================================= */}
+      ===================================== */}
 
       {view === "join" && (
         <section className="card narrow">
@@ -772,36 +814,45 @@ export default function App() {
 
           <input
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(event) => setName(event.target.value)}
             placeholder="Discord-ник"
+            maxLength={24}
           />
+
+          <div style={{ height: 10 }} />
 
           <input
             value={code}
-            onChange={(e) => setCode(e.target.value.toUpperCase())}
+            onChange={(event) =>
+              setCode(
+                event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""),
+              )
+            }
             placeholder="Код комнаты"
             maxLength={5}
           />
+
+          <div style={{ height: 12 }} />
 
           <button
             className="primary full"
             onClick={joinRoom}
             disabled={loading}
           >
-            {loading ? "Вход..." : "Войти"}
+            {loading ? "Подключаемся..." : "Войти"}
           </button>
         </section>
       )}
 
-      {/* =================================
+      {/* =====================================
           LOBBY
-      ================================= */}
+      ===================================== */}
 
       {view === "lobby" && room && (
         <section className="card">
           <div className="top">
             <div>
-              <span className="eyebrow">КОМНАТА</span>
+              <span className="eyebrow">КОМНАТА · РАУНД {room.round}</span>
 
               <h2>{room.code}</h2>
             </div>
@@ -810,18 +861,20 @@ export default function App() {
               className="secondary"
               onClick={() => navigator.clipboard?.writeText(room.code)}
             >
-              Копировать
+              📋 Копировать
             </button>
           </div>
 
-          <p>Кинь код в Discord и жди остальных.</p>
+          <p>Кинь код комнаты в Discord и жди остальных игроков.</p>
 
           <div className="players">
-            {sorted.map((player) => (
+            {sortedPlayers.map((player) => (
               <div className="player" key={player.uid}>
                 <span>
                   🟢 {player.name}
-                  {player.uid === room.hostId && " · host"}
+                  {player.uid === room.hostId && (
+                    <span className="host-label">HOST</span>
+                  )}
                 </span>
 
                 {host && player.uid !== me.uid && (
@@ -842,119 +895,80 @@ export default function App() {
               onClick={startGame}
               disabled={loading || players.length < 3}
             >
-              {players.length < 3 ? "Нужно минимум 3 игрока" : "Начать игру"}
+              {players.length < 3
+                ? `Нужно ещё ${3 - players.length} игрока`
+                : "🕵️ Начать раунд"}
             </button>
           ) : (
-            <div className="waiting">Ждём, пока создатель запустит игру…</div>
+            <div className="waiting">
+              🕐 Ждём, пока ведущий запустит игру...
+            </div>
           )}
         </section>
       )}
 
-      {/* =================================
-          ROLE
-      ================================= */}
-
-      {view === "role" && (
-        <section className="card center">
-          <span className="eyebrow">
-            РАУНД {room?.round} ·{" "}
-            {role?.roundType === "item" ? "ПРЕДМЕТ" : "ЛОКАЦИЯ"}
-          </span>
-
-          <div className="big">
-            {role?.isSpy ? "🕵️" : role?.roundType === "item" ? "🎒" : "📍"}
-          </div>
-
-          <h2>
-            {role?.isSpy
-              ? "Ты — ШПИОН"
-              : role?.roundType === "item"
-                ? "Твой предмет"
-                : "Твоя локация"}
-          </h2>
-
-          <p>
-            {role?.isSpy
-              ? role?.roundType === "item"
-                ? "Ты не знаешь предмет. Слушай ответы других игроков и попробуй понять, что это за вещь."
-                : "Ты не знаешь локацию. Слушай ответы других игроков и попробуй понять, где все находятся."
-              : role?.roundType === "item"
-                ? "У всех мирных один и тот же предмет. Не называй его напрямую и попробуй вычислить шпиона."
-                : "У всех мирных одна и та же локация. Не называй её напрямую и попробуй вычислить шпиона."}
-          </p>
-
-          {/* SPY */}
-
-          {role?.isSpy ? (
-            <div className="hiddenPlace">
-              🕵️
-              <strong>Ты — ШПИОН</strong>
-              <span>
-                {role?.roundType === "item"
-                  ? "Предмет скрыт"
-                  : "Локация скрыта"}
-              </span>
-            </div>
-          ) : (
-            <div className="location">
-              {role?.roundType === "item" ? "🎒" : "📍"}
-
-              <strong>{role?.answer}</strong>
-            </div>
-          )}
-
-          <button className="primary full" onClick={goDiscussion}>
-            Я запомнил →
-          </button>
-        </section>
-      )}
-
-      {/* =================================
+      {/* =====================================
           DISCUSSION
-      ================================= */}
+      ===================================== */}
 
-      {view === "discussion" && (
+      {view === "discussion" && room && (
         <section className="card">
-          <span className="eyebrow">ОБСУЖДЕНИЕ</span>
+          <span className="eyebrow">РАУНД {room.round} · ОБСУЖДЕНИЕ</span>
 
-          <h2>Переходим в Discord</h2>
+          <h2>Кто здесь шпион?</h2>
 
           <p>
-            Теперь начинается самое интересное. Общайтесь, задавайте вопросы и
-            пытайтесь понять, кто здесь шпион.
+            Теперь переходим в Discord. Ивентеры будут по очереди поднимать
+            игроков на трибуну.
           </p>
 
           <div className="tips">
-            <div>🎙️ Общайтесь в Discord</div>
+            <div>
+              🎙️ <b>Переходим в Discord</b>
+              <br />
+              Общаемся и отвечаем на вопросы.
+            </div>
 
-            <div>🧠 Не называйте локацию или предмет напрямую</div>
+            <div>
+              🧠 <b>Говори аккуратно</b>
+              <br />
+              Не называй локацию или предмет напрямую.
+            </div>
 
-            <div>👀 Следите за подозрительными ответами</div>
+            <div>
+              🕵️ <b>Следи за другими</b>
+              <br />
+              Шпион пытается понять, где вы находитесь.
+            </div>
 
-            <div>🕵️ Шпион пытается не спалиться</div>
+            <div>
+              🎤 <b>Трибуна</b>
+              <br />
+              Каждый участник должен назвать один факт про локацию или предмет.
+            </div>
           </div>
 
           {host ? (
             <button className="primary full" onClick={goVote}>
-              Перейти к голосованию
+              🗳️ Перейти к голосованию
             </button>
           ) : (
-            <div className="waiting">Ждём ведущего…</div>
+            <div className="waiting">🕐 Ждём ведущего...</div>
           )}
         </section>
       )}
 
-      {/* =================================
+      {/* =====================================
           VOTE
-      ================================= */}
+      ===================================== */}
 
-      {view === "vote" && (
+      {view === "vote" && room && (
         <section className="card">
-          <span className="eyebrow">ГОЛОСОВАНИЕ</span>
+          <span className="eyebrow">РАУНД {room.round} · ГОЛОСОВАНИЕ</span>
 
           <h2>Кто шпион?</h2>
 
-          <p>Выбери одного игрока, которого считаешь шпионом.</p>
+          <p>Выбери одного игрока, которого подозреваешь.</p>
 
           <div className="voteList">
             {players
@@ -965,66 +979,63 @@ export default function App() {
                     "vote " + (selected === player.uid ? "selected" : "")
                   }
                   key={player.uid}
-                  onClick={() => !hasVoted && setSelected(player.uid)}
-                  disabled={hasVoted}
+                  onClick={() => setSelected(player.uid)}
                 >
                   👤 {player.name}
+                  {selected === player.uid && <span>✓</span>}
                 </button>
               ))}
           </div>
 
           <button
             className="primary full"
-            disabled={!selected || hasVoted || loading}
+            disabled={!selected || loading}
             onClick={vote}
           >
-            {hasVoted
-              ? "✓ Ты проголосовал"
-              : loading
-                ? "Отправка..."
-                : "Проголосовать"}
+            {loading ? "Считаем голоса..." : "🗳️ Проголосовать"}
           </button>
 
-          <small>
-            {hasVoted
-              ? "Ждём остальных игроков."
-              : "Результат появится, когда проголосуют все."}
-          </small>
+          <small>Результат появится, когда проголосуют все игроки.</small>
         </section>
       )}
 
-      {/* =================================
+      {/* =====================================
           RESULTS
-      ================================= */}
+      ===================================== */}
 
-      {view === "result" && (
+      {view === "result" && room && (
         <section className="card center">
-          <span className="eyebrow">
-            РАУНД {room?.round}
-            {" · "}
-            РЕЗУЛЬТАТ
-          </span>
+          <span className="eyebrow">РАУНД {room.round} · РЕЗУЛЬТАТ</span>
 
-          <div className="big">{room?.caught ? "🎯" : "🕵️"}</div>
+          <div className="big">{room.caught ? "🏆" : "💀"}</div>
 
-          <h2>{room?.caught ? "Шпион найден!" : "Шпион не найден!"}</h2>
+          <h2>{room.caught ? "Шпион найден!" : "Шпион не найден!"}</h2>
 
           <p>
-            {room?.caught
-              ? "Мирные игроки смогли вычислить шпиона."
-              : "Шпион смог запутать игроков и остался незамеченным."}
+            {room.caught
+              ? "Мирные правильно вычислили шпиона."
+              : "Шпиону удалось остаться незамеченным."}
           </p>
 
-          {/* ANSWER */}
+          <div className="result-answer">
+            <span>НАСТОЯЩИЙ ШПИОН</span>
+
+            <strong>
+              {players.find((player) => player.uid === room.spyId)?.name ||
+                "Неизвестно"}
+            </strong>
+          </div>
 
           <div className="result-answer">
-            <span>
-              {room?.roundType === "item"
-                ? "🎒 Был предмет"
-                : "📍 Была локация"}
-            </span>
+            <span>ЛОКАЦИЯ</span>
 
-            <strong>{room?.answer}</strong>
+            <strong>📍 {room.location}</strong>
+          </div>
+
+          <div className="result-answer">
+            <span>ПРЕДМЕТ</span>
+
+            <strong>🎒 {room.item}</strong>
           </div>
 
           <div className="scoreboard">
@@ -1042,16 +1053,26 @@ export default function App() {
           </div>
 
           {host && (
-            <button className="primary full" onClick={nextRound}>
-              Следующий раунд →
+            <button
+              className="primary full"
+              onClick={nextRound}
+              disabled={loading}
+            >
+              {loading ? "Подготавливаем..." : "🔄 Следующий раунд"}
             </button>
+          )}
+
+          {!host && (
+            <div className="waiting">
+              🕐 Ждём ведущего перед следующим раундом...
+            </div>
           )}
         </section>
       )}
 
-      {/* =================================
+      {/* =====================================
           LEAVE
-      ================================= */}
+      ===================================== */}
 
       {me.roomId && (
         <button className="leave" onClick={leave}>
@@ -1062,9 +1083,9 @@ export default function App() {
   );
 }
 
-// ========================================
-// FIREBASE SETUP
-// ========================================
+/* =========================================
+   FIREBASE SETUP SCREEN
+========================================= */
 
 function Setup() {
   return (
@@ -1078,10 +1099,7 @@ function Setup() {
 
         <h2>Подключи Firebase</h2>
 
-        <p>
-          Скопируй <b>.env.example</b> в <b>.env.local</b> и вставь настройки
-          Firebase.
-        </p>
+        <p>Проверь файл .env.local и настройки Firebase.</p>
 
         <pre>
           {`npm install
