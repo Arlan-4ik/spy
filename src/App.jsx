@@ -1,7 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
+
 import {
   collection,
+  deleteDoc,
   doc,
+  getDoc,
   getDocs,
   onSnapshot,
   query,
@@ -12,9 +15,14 @@ import {
 } from "firebase/firestore";
 
 import { db, firebaseConfigured } from "./firebase";
-import { LOCATIONS, randomCode, pick } from "./game";
+
+import { LOCATIONS, ITEMS, randomCode, pick, randomRoundType } from "./game";
 
 const LS = "spy-night-player";
+
+// ========================================
+// LOCAL STORAGE
+// ========================================
 
 const load = () => {
   try {
@@ -24,372 +32,676 @@ const load = () => {
   }
 };
 
-const save = (x) => localStorage.setItem(LS, JSON.stringify(x));
+const save = (data) => {
+  localStorage.setItem(LS, JSON.stringify(data));
+};
+
+// ========================================
+// APP
+// ========================================
 
 export default function App() {
   const [me, setMe] = useState(load());
+
   const [room, setRoom] = useState(null);
   const [players, setPlayers] = useState([]);
+
   const [role, setRole] = useState(null);
 
   const [view, setView] = useState("home");
 
   const [name, setName] = useState(me.name || "");
+
   const [code, setCode] = useState("");
 
   const [error, setError] = useState("");
+
   const [selected, setSelected] = useState("");
+
   const [loading, setLoading] = useState(false);
 
-  /* =====================================================
-     FIREBASE ROOM LISTENER
-  ===================================================== */
+  const [hasVoted, setHasVoted] = useState(false);
+
+  const [kicked, setKicked] = useState(false);
+
+  // ========================================
+  // ROOM LISTENER
+  // ========================================
 
   useEffect(() => {
     if (!me.roomId) return;
 
-    const unsubRoom = onSnapshot(doc(db, "rooms", me.roomId), (snapshot) => {
-      if (!snapshot.exists()) {
-        setError("Комната больше не существует.");
-        return;
-      }
+    const roomRef = doc(db, "rooms", me.roomId);
 
-      const data = {
-        id: snapshot.id,
-        ...snapshot.data(),
-      };
+    const unsubRoom = onSnapshot(
+      roomRef,
+      (snapshot) => {
+        if (!snapshot.exists()) {
+          setError("Комната не найдена.");
+          return;
+        }
 
-      setRoom(data);
+        const data = {
+          id: snapshot.id,
+          ...snapshot.data(),
+        };
 
-      if (data.phase === "lobby") setView("lobby");
-      if (data.phase === "roles") setView("role");
-      if (data.phase === "discussion") setView("discussion");
-      if (data.phase === "voting") setView("vote");
-      if (data.phase === "results") setView("result");
-    });
+        setRoom(data);
 
+        if (data.phase === "lobby") {
+          setView("lobby");
+        }
+
+        if (data.phase === "roles") {
+          setView("role");
+        }
+
+        if (data.phase === "discussion") {
+          setView("discussion");
+        }
+
+        if (data.phase === "voting") {
+          setView("vote");
+        }
+
+        if (data.phase === "results") {
+          setView("result");
+        }
+      },
+      (err) => {
+        setError(err.message);
+      },
+    );
+
+    // PLAYERS
     const playersQuery = query(collection(db, "rooms", me.roomId, "players"));
 
     const unsubPlayers = onSnapshot(playersQuery, (snapshot) => {
-      setPlayers(
-        snapshot.docs.map((d) => ({
-          id: d.id,
-          ...d.data(),
-        })),
-      );
+      const list = snapshot.docs.map((d) => ({
+        id: d.id,
+        ...d.data(),
+      }));
+
+      setPlayers(list);
+
+      const stillHere = list.some((player) => player.uid === me.uid);
+
+      if (me.uid && !stillHere) {
+        setKicked(true);
+
+        localStorage.removeItem(LS);
+      }
     });
 
     return () => {
       unsubRoom();
       unsubPlayers();
     };
-  }, [me.roomId]);
+  }, [me.roomId, me.uid]);
 
-  /* =====================================================
-     PRIVATE ROLE
-  ===================================================== */
+  // ========================================
+  // PRIVATE ROLE
+  // ========================================
 
   useEffect(() => {
-    if (!me.roomId || !me.uid) return;
+    if (!me.roomId || !me.uid) {
+      return;
+    }
 
-    const unsub = onSnapshot(
-      doc(db, "rooms", me.roomId, "privateRoles", me.uid),
-      (snapshot) => {
-        if (snapshot.exists()) {
-          setRole(snapshot.data());
-        }
-      },
-    );
+    const roleRef = doc(db, "rooms", me.roomId, "privateRoles", me.uid);
+
+    const unsub = onSnapshot(roleRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setRole(snapshot.data());
+      }
+    });
 
     return unsub;
   }, [me.roomId, me.uid]);
 
+  // ========================================
+  // CHECK VOTE
+  // ========================================
+
+  useEffect(() => {
+    async function checkVote() {
+      if (!me.roomId || !me.uid) {
+        return;
+      }
+
+      try {
+        const voteRef = doc(db, "rooms", me.roomId, "votes", me.uid);
+
+        const snapshot = await getDoc(voteRef);
+
+        if (snapshot.exists() && snapshot.data()?.votedFor) {
+          setHasVoted(true);
+        } else {
+          setHasVoted(false);
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    checkVote();
+  }, [me.roomId, me.uid, view]);
+
+  // ========================================
+  // HOST
+  // ========================================
+
   const host = room?.hostId === me.uid;
 
-  const sorted = useMemo(
-    () =>
-      [...players].sort(
-        (a, b) => (a.joinedAt?.seconds || 0) - (b.joinedAt?.seconds || 0),
-      ),
-    [players],
-  );
+  // ========================================
+  // SORT PLAYERS
+  // ========================================
 
-  /* =====================================================
-     CREATE ROOM
-  ===================================================== */
+  const sorted = useMemo(() => {
+    return [...players].sort(
+      (a, b) => (a.joinedAt?.seconds || 0) - (b.joinedAt?.seconds || 0),
+    );
+  }, [players]);
+
+  // ========================================
+  // CREATE ROOM
+  // ========================================
 
   async function createRoom() {
     setError("");
 
     if (!name.trim()) {
-      setError("Сначала введи свой ник.");
-      return;
+      return setError("Сначала введи ник.");
     }
 
     setLoading(true);
 
     try {
       const roomCode = randomCode();
+
       const roomRef = doc(collection(db, "rooms"));
 
       const uid = crypto.randomUUID();
 
       await setDoc(roomRef, {
         code: roomCode,
+
         hostId: uid,
+
         phase: "lobby",
+
         round: 1,
+
         createdAt: serverTimestamp(),
-        location: null,
+
+        roundType: null,
+
+        answer: null,
+
         spyId: null,
+
+        caught: null,
+
+        winnerId: null,
       });
 
       await setDoc(doc(roomRef, "players", uid), {
         name: name.trim(),
+
         uid,
+
         score: 0,
+
         joinedAt: serverTimestamp(),
       });
 
       const identity = {
         uid,
+
         name: name.trim(),
+
         roomId: roomRef.id,
+
         code: roomCode,
       };
 
       save(identity);
+
       setMe(identity);
+
       setView("lobby");
-    } catch (e) {
-      setError(e.message);
+    } catch (err) {
+      setError(err.message);
     } finally {
       setLoading(false);
     }
   }
 
-  /* =====================================================
-     JOIN ROOM
-  ===================================================== */
+  // ========================================
+  // JOIN ROOM
+  // ========================================
 
   async function joinRoom() {
     setError("");
 
     if (!name.trim() || !code.trim()) {
-      setError("Введи ник и код комнаты.");
-      return;
+      return setError("Введи ник и код.");
     }
 
     setLoading(true);
 
     try {
-      const snap = await getDocs(
+      const snapshot = await getDocs(
         query(
           collection(db, "rooms"),
           where("code", "==", code.trim().toUpperCase()),
         ),
       );
 
-      if (snap.empty) {
+      if (snapshot.empty) {
         throw Error("Комната с таким кодом не найдена.");
       }
 
-      const r = snap.docs[0];
+      const roomDoc = snapshot.docs[0];
+
+      const roomData = roomDoc.data();
+
+      if (roomData.phase !== "lobby") {
+        throw Error("Игра уже началась. Дождись следующего раунда.");
+      }
+
       const uid = crypto.randomUUID();
 
-      await setDoc(doc(r.ref, "players", uid), {
+      await setDoc(doc(roomDoc.ref, "players", uid), {
         name: name.trim(),
+
         uid,
+
         score: 0,
+
         joinedAt: serverTimestamp(),
       });
 
       const identity = {
         uid,
+
         name: name.trim(),
-        roomId: r.id,
-        code: r.data().code,
+
+        roomId: roomDoc.id,
+
+        code: roomData.code,
       };
 
       save(identity);
+
       setMe(identity);
+
       setView("lobby");
-    } catch (e) {
-      setError(e.message);
+    } catch (err) {
+      setError(err.message);
     } finally {
       setLoading(false);
     }
   }
 
-  /* =====================================================
-     START GAME
-  ===================================================== */
+  // ========================================
+  // START GAME
+  // ========================================
 
   async function startGame() {
     if (!host) return;
 
     if (players.length < 3) {
-      setError("Нужно минимум 3 игрока.");
-      return;
+      return setError("Нужно минимум 3 игрока.");
     }
 
-    const spy = pick(players);
-    const location = pick(LOCATIONS);
+    try {
+      setLoading(true);
 
-    const writes = [];
+      // Выбираем тип раунда
+      const roundType = randomRoundType();
 
-    for (const player of players) {
-      const privateRef = doc(
-        db,
-        "rooms",
-        me.roomId,
-        "privateRoles",
-        player.uid,
-      );
+      // Выбираем ответ
+      const answer = roundType === "location" ? pick(LOCATIONS) : pick(ITEMS);
 
-      writes.push(
-        setDoc(
-          privateRef,
+      // Выбираем шпиона
+      const spy = pick(players);
+
+      // Создаём приватные роли
+      const promises = [];
+
+      for (const player of players) {
+        const privateRef = doc(
+          db,
+          "rooms",
+          me.roomId,
+          "privateRoles",
+          player.uid,
+        );
+
+        const data =
           player.uid === spy.uid
             ? {
                 isSpy: true,
-                location: null,
+
+                roundType,
+
+                answer: null,
               }
             : {
                 isSpy: false,
-                location,
-              },
-        ),
-      );
+
+                roundType,
+
+                answer,
+              };
+
+        promises.push(setDoc(privateRef, data));
+      }
+
+      await Promise.all(promises);
+
+      // Обновляем комнату
+      await updateDoc(doc(db, "rooms", me.roomId), {
+        phase: "roles",
+
+        roundType,
+
+        answer,
+
+        spyId: spy.uid,
+
+        caught: null,
+
+        winnerId: null,
+      });
+
+      setHasVoted(false);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
     }
-
-    await Promise.all(writes);
-
-    await updateDoc(doc(db, "rooms", me.roomId), {
-      phase: "roles",
-      location,
-      spyId: spy.uid,
-    });
   }
+
+  // ========================================
+  // GO DISCUSSION
+  // ========================================
 
   async function goDiscussion() {
-    await updateDoc(doc(db, "rooms", me.roomId), {
-      phase: "discussion",
-    });
+    if (!role) {
+      return setError("Роль ещё загружается.");
+    }
+
+    try {
+      await updateDoc(doc(db, "rooms", me.roomId), {
+        phase: "discussion",
+      });
+    } catch (err) {
+      setError(err.message);
+    }
   }
+
+  // ========================================
+  // GO VOTE
+  // ========================================
 
   async function goVote() {
-    await updateDoc(doc(db, "rooms", me.roomId), {
-      phase: "voting",
-    });
+    if (!host) return;
+
+    try {
+      await updateDoc(doc(db, "rooms", me.roomId), {
+        phase: "voting",
+      });
+
+      setSelected("");
+
+      setHasVoted(false);
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
-  /* =====================================================
-     VOTE
-  ===================================================== */
+  // ========================================
+  // VOTE
+  // ========================================
 
   async function vote() {
     if (!selected) return;
 
-    await setDoc(doc(db, "rooms", me.roomId, "votes", me.uid), {
-      votedFor: selected,
-    });
+    if (selected === me.uid) {
+      return setError("Нельзя голосовать за самого себя.");
+    }
 
-    const votesSnap = await getDocs(
-      collection(db, "rooms", me.roomId, "votes"),
-    );
+    if (hasVoted) {
+      return setError("Ты уже проголосовал.");
+    }
 
-    if (votesSnap.size >= players.length) {
-      const counts = {};
+    try {
+      setLoading(true);
 
-      votesSnap.forEach((d) => {
-        const votedFor = d.data().votedFor;
+      await setDoc(doc(db, "rooms", me.roomId, "votes", me.uid), {
+        votedFor: selected,
 
-        if (!votedFor) return;
-
-        counts[votedFor] = (counts[votedFor] || 0) + 1;
+        votedAt: serverTimestamp(),
       });
 
-      const winner = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0];
+      setHasVoted(true);
 
-      if (!winner) return;
+      const votesSnapshot = await getDocs(
+        collection(db, "rooms", me.roomId, "votes"),
+      );
 
-      const found = winner === room.spyId;
+      if (votesSnapshot.size >= players.length) {
+        const counts = {};
 
-      for (const player of players) {
-        let add = 0;
+        votesSnapshot.forEach((voteDoc) => {
+          const votedFor = voteDoc.data().votedFor;
 
-        if (found && player.uid !== room.spyId) {
-          add = 2;
+          if (!votedFor) return;
+
+          counts[votedFor] = (counts[votedFor] || 0) + 1;
+        });
+
+        const sortedVotes = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+
+        if (!sortedVotes.length) {
+          return;
         }
 
-        if (!found && player.uid === room.spyId) {
-          add = 3;
+        const winner = sortedVotes[0][0];
+
+        const found = winner === room.spyId;
+
+        // Очки
+        for (const player of players) {
+          let add = 0;
+
+          // Мирные нашли шпиона
+          if (found && player.uid !== room.spyId) {
+            add = 2;
+          }
+
+          // Шпион остался незамеченным
+          if (!found && player.uid === room.spyId) {
+            add = 3;
+          }
+
+          if (add) {
+            await updateDoc(
+              doc(db, "rooms", me.roomId, "players", player.uid),
+              {
+                score: (player.score || 0) + add,
+              },
+            );
+          }
         }
 
-        if (add) {
-          await updateDoc(doc(db, "rooms", me.roomId, "players", player.uid), {
-            score: (player.score || 0) + add,
-          });
-        }
+        await updateDoc(doc(db, "rooms", me.roomId), {
+          phase: "results",
+
+          caught: found,
+
+          winnerId: winner,
+        });
       }
-
-      await updateDoc(doc(db, "rooms", me.roomId), {
-        phase: "results",
-        caught: found,
-        winnerId: winner,
-      });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
     }
   }
 
-  /* =====================================================
-     NEXT ROUND
-  ===================================================== */
+  // ========================================
+  // NEXT ROUND
+  // ========================================
 
   async function nextRound() {
-    const next = (room.round || 1) + 1;
+    if (!host) return;
 
-    const voteSnap = await getDocs(collection(db, "rooms", me.roomId, "votes"));
+    try {
+      const nextRound = (room.round || 1) + 1;
 
-    await Promise.all(
-      voteSnap.docs.map((d) =>
-        setDoc(d.ref, {
-          votedFor: "",
-        }),
-      ),
+      // Удаляем старые роли
+      const rolesSnapshot = await getDocs(
+        collection(db, "rooms", me.roomId, "privateRoles"),
+      );
+
+      await Promise.all(rolesSnapshot.docs.map((item) => deleteDoc(item.ref)));
+
+      // Удаляем старые голоса
+      const votesSnapshot = await getDocs(
+        collection(db, "rooms", me.roomId, "votes"),
+      );
+
+      await Promise.all(votesSnapshot.docs.map((item) => deleteDoc(item.ref)));
+
+      await updateDoc(doc(db, "rooms", me.roomId), {
+        phase: "lobby",
+
+        round: nextRound,
+
+        roundType: null,
+
+        answer: null,
+
+        spyId: null,
+
+        caught: null,
+
+        winnerId: null,
+      });
+
+      setRole(null);
+
+      setSelected("");
+
+      setHasVoted(false);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  // ========================================
+  // REMOVE PLAYER
+  // ========================================
+
+  async function removePlayer(player) {
+    if (!host) return;
+
+    if (player.uid === me.uid) {
+      return setError("Нельзя удалить самого себя.");
+    }
+
+    const confirmed = window.confirm(
+      `Удалить игрока "${player.name}" из комнаты?`,
     );
 
-    await updateDoc(doc(db, "rooms", me.roomId), {
-      phase: "lobby",
-      round: next,
-      location: null,
-      spyId: null,
-      caught: null,
-      winnerId: null,
-    });
+    if (!confirmed) return;
 
-    setRole(null);
-    setSelected("");
+    try {
+      await deleteDoc(doc(db, "rooms", me.roomId, "players", player.uid));
+
+      await deleteDoc(doc(db, "rooms", me.roomId, "privateRoles", player.uid));
+
+      await deleteDoc(doc(db, "rooms", me.roomId, "votes", player.uid));
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
-  function leave() {
-    localStorage.removeItem(LS);
-    window.location.reload();
+  // ========================================
+  // LEAVE
+  // ========================================
+
+  async function leave() {
+    const confirmed = window.confirm("Точно хочешь выйти из комнаты?");
+
+    if (!confirmed) return;
+
+    try {
+      if (me.roomId && me.uid && !host) {
+        await deleteDoc(doc(db, "rooms", me.roomId, "players", me.uid));
+      }
+
+      localStorage.removeItem(LS);
+
+      window.location.reload();
+    } catch (err) {
+      setError(err.message);
+    }
   }
 
-  /* =====================================================
-     SETUP
-  ===================================================== */
+  // ========================================
+  // KICKED
+  // ========================================
+
+  if (kicked) {
+    return (
+      <div className="app">
+        <header>
+          <div className="logo">🕵️ SPY NIGHT</div>
+        </header>
+
+        <section className="card center">
+          <div className="big">🚫</div>
+
+          <span className="eyebrow">ДОСТУП ЗАКРЫТ</span>
+
+          <h2>Тебя удалили</h2>
+
+          <p>Ведущий удалил тебя из этой комнаты.</p>
+
+          <button
+            className="primary full"
+            onClick={() => {
+              localStorage.removeItem(LS);
+
+              window.location.reload();
+            }}
+          >
+            Вернуться
+          </button>
+        </section>
+      </div>
+    );
+  }
+
+  // ========================================
+  // FIREBASE SETUP
+  // ========================================
 
   if (!firebaseConfigured) {
     return <Setup />;
   }
 
+  // ========================================
+  // MAIN
+  // ========================================
+
   return (
     <div className="app">
-      {/* =================================================
-          HEADER
-      ================================================= */}
+      {/* HEADER */}
 
       <header>
         <div className="logo">🕵️ SPY NIGHT</div>
@@ -397,9 +709,7 @@ export default function App() {
         <div className="pill">REALTIME</div>
       </header>
 
-      {/* =================================================
-          ERROR
-      ================================================= */}
+      {/* ERROR */}
 
       {error && (
         <div className="error">
@@ -409,35 +719,34 @@ export default function App() {
         </div>
       )}
 
-      {/* =================================================
+      {/* =================================
           HOME
-      ================================================= */}
+      ================================= */}
 
       {view === "home" && (
         <section className="hero">
-          <div className="eyebrow">DISCORD MULTIPLAYER EVENT</div>
+          <span className="eyebrow">DISCORD EVENT</span>
 
           <h1>
-            КТО?
+            Найди шпиона,
             <br />
-            <em>ШПИОН</em>
+            <em>если сможешь.</em>
           </h1>
 
           <p>
-            Один из вас — шпион. Остальные знают локацию. Общайтесь в Discord,
-            задавайте вопросы и попробуйте вычислить того, кто ничего не знает.
+            Заходите на сайт, а общайтесь в Discord. Роли, голосование и
+            результаты синхронизируются у всех игроков в реальном времени.
           </p>
 
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="Введите Discord-ник"
-            maxLength={24}
+            placeholder="Твой Discord-ник"
           />
 
           <div className="actions">
             <button className="primary" onClick={createRoom} disabled={loading}>
-              {loading ? "Создаём..." : "Создать игру →"}
+              {loading ? "Создание..." : "Создать комнату"}
             </button>
 
             <button className="secondary" onClick={() => setView("join")}>
@@ -447,66 +756,52 @@ export default function App() {
         </section>
       )}
 
-      {/* =================================================
+      {/* =================================
           JOIN
-      ================================================= */}
+      ================================= */}
 
       {view === "join" && (
         <section className="card narrow">
           <button className="back" onClick={() => setView("home")}>
-            ← Назад
+            ← назад
           </button>
 
-          <div className="eyebrow">JOIN GAME</div>
+          <span className="eyebrow">ВОЙТИ</span>
 
-          <h2>
-            Войти
-            <br />в игру
-          </h2>
-
-          <p>Получи код комнаты у ведущего и присоединяйся.</p>
-
-          <div style={{ height: 20 }} />
+          <h2>В комнату</h2>
 
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="Discord-ник"
-            maxLength={24}
           />
-
-          <div style={{ height: 8 }} />
 
           <input
             value={code}
             onChange={(e) => setCode(e.target.value.toUpperCase())}
-            placeholder="КОД КОМНАТЫ"
+            placeholder="Код комнаты"
             maxLength={5}
           />
-
-          <div style={{ height: 10 }} />
 
           <button
             className="primary full"
             onClick={joinRoom}
             disabled={loading}
           >
-            {loading ? "Подключение..." : "Войти в комнату →"}
+            {loading ? "Вход..." : "Войти"}
           </button>
         </section>
       )}
 
-      {/* =================================================
+      {/* =================================
           LOBBY
-      ================================================= */}
+      ================================= */}
 
       {view === "lobby" && room && (
         <section className="card">
           <div className="top">
             <div>
-              <div className="eyebrow">
-                ROUND {String(room.round).padStart(2, "0")}
-              </div>
+              <span className="eyebrow">КОМНАТА</span>
 
               <h2>{room.code}</h2>
             </div>
@@ -515,251 +810,222 @@ export default function App() {
               className="secondary"
               onClick={() => navigator.clipboard?.writeText(room.code)}
             >
-              COPY CODE
+              Копировать
             </button>
           </div>
 
-          <p>Отправь этот код в Discord. Когда все зайдут — запускай раунд.</p>
+          <p>Кинь код в Discord и жди остальных.</p>
 
           <div className="players">
-            {sorted.map((player, index) => (
+            {sorted.map((player) => (
               <div className="player" key={player.uid}>
-                <span>🟢</span>
-
-                <span
-                  style={{
-                    marginLeft: 8,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                  }}
-                >
-                  {player.name}
+                <span>
+                  🟢 {player.name}
+                  {player.uid === room.hostId && " · host"}
                 </span>
 
-                {player.uid === room.hostId && (
-                  <span
-                    style={{
-                      marginLeft: "auto",
-                      color: "#b7a5ff",
-                      fontSize: 9,
-                      letterSpacing: ".12em",
-                    }}
+                {host && player.uid !== me.uid && (
+                  <button
+                    className="remove-player"
+                    onClick={() => removePlayer(player)}
                   >
-                    HOST
-                  </span>
+                    ×
+                  </button>
                 )}
               </div>
             ))}
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              marginBottom: 12,
-              color: "#686b77",
-              fontSize: 10,
-              textTransform: "uppercase",
-              letterSpacing: ".15em",
-            }}
-          >
-            <span>Players</span>
-
-            <span>{players.length} / ∞</span>
           </div>
 
           {host ? (
             <button
               className="primary full"
               onClick={startGame}
-              disabled={players.length < 3}
+              disabled={loading || players.length < 3}
             >
-              {players.length < 3 ? "Нужно ещё игроков" : "Начать раунд →"}
+              {players.length < 3 ? "Нужно минимум 3 игрока" : "Начать игру"}
             </button>
           ) : (
-            <div className="waiting">● Ведущий готовит игру...</div>
+            <div className="waiting">Ждём, пока создатель запустит игру…</div>
           )}
         </section>
       )}
 
-      {/* =================================================
+      {/* =================================
           ROLE
-      ================================================= */}
+      ================================= */}
 
       {view === "role" && (
         <section className="card center">
-          <div className="eyebrow">
-            YOUR ROLE · ROUND {String(room?.round || 1).padStart(2, "0")}
+          <span className="eyebrow">
+            РАУНД {room?.round} ·{" "}
+            {role?.roundType === "item" ? "ПРЕДМЕТ" : "ЛОКАЦИЯ"}
+          </span>
+
+          <div className="big">
+            {role?.isSpy ? "🕵️" : role?.roundType === "item" ? "🎒" : "📍"}
           </div>
 
-          <div className="big">{role?.isSpy ? "🕵️" : "📍"}</div>
-
           <h2>
-            {role?.isSpy ? (
-              <>
-                Ты —
-                <br />
-                ШПИОН
-              </>
-            ) : (
-              <>
-                Ты —
-                <br />
-                МИРНЫЙ
-              </>
-            )}
+            {role?.isSpy
+              ? "Ты — ШПИОН"
+              : role?.roundType === "item"
+                ? "Твой предмет"
+                : "Твоя локация"}
           </h2>
 
           <p>
             {role?.isSpy
-              ? "Ты не знаешь локацию. Слушай ответы остальных и постарайся понять, где вы находитесь."
-              : "Все мирные знают одну локацию. Не называй её напрямую и попробуй вычислить шпиона."}
+              ? role?.roundType === "item"
+                ? "Ты не знаешь предмет. Слушай ответы других игроков и попробуй понять, что это за вещь."
+                : "Ты не знаешь локацию. Слушай ответы других игроков и попробуй понять, где все находятся."
+              : role?.roundType === "item"
+                ? "У всех мирных один и тот же предмет. Не называй его напрямую и попробуй вычислить шпиона."
+                : "У всех мирных одна и та же локация. Не называй её напрямую и попробуй вычислить шпиона."}
           </p>
 
+          {/* SPY */}
+
           {role?.isSpy ? (
-            <div className="hiddenPlace">🔒 ЛОКАЦИЯ СКРЫТА</div>
+            <div className="hiddenPlace">
+              🕵️
+              <strong>Ты — ШПИОН</strong>
+              <span>
+                {role?.roundType === "item"
+                  ? "Предмет скрыт"
+                  : "Локация скрыта"}
+              </span>
+            </div>
           ) : (
-            <div className="location">📍 {role?.location}</div>
+            <div className="location">
+              {role?.roundType === "item" ? "🎒" : "📍"}
+
+              <strong>{role?.answer}</strong>
+            </div>
           )}
 
           <button className="primary full" onClick={goDiscussion}>
-            Я ЗАПОМНИЛ →
+            Я запомнил →
           </button>
         </section>
       )}
 
-      {/* =================================================
+      {/* =================================
           DISCUSSION
-      ================================================= */}
+      ================================= */}
 
       {view === "discussion" && (
         <section className="card">
-          <div className="eyebrow">PHASE 02 · DISCUSSION</div>
+          <span className="eyebrow">ОБСУЖДЕНИЕ</span>
 
-          <h2>
-            Время
-            <br />
-            вопросов.
-          </h2>
+          <h2>Переходим в Discord</h2>
 
           <p>
-            Переходите в Discord. Задавайте друг другу вопросы, отвечайте
-            осторожно и ищите того, кто пытается притворяться.
+            Теперь начинается самое интересное. Общайтесь, задавайте вопросы и
+            пытайтесь понять, кто здесь шпион.
           </p>
 
           <div className="tips">
-            <div>
-              🎙️
-              <span style={{ marginLeft: 10 }}>Общайтесь в Discord</span>
-            </div>
+            <div>🎙️ Общайтесь в Discord</div>
 
-            <div>
-              🧠
-              <span style={{ marginLeft: 10 }}>
-                Не называйте локацию напрямую
-              </span>
-            </div>
+            <div>🧠 Не называйте локацию или предмет напрямую</div>
 
-            <div>
-              🕵️
-              <span style={{ marginLeft: 10 }}>
-                Следите за подозрительными ответами
-              </span>
-            </div>
+            <div>👀 Следите за подозрительными ответами</div>
+
+            <div>🕵️ Шпион пытается не спалиться</div>
           </div>
 
           {host ? (
             <button className="primary full" onClick={goVote}>
-              Открыть голосование →
+              Перейти к голосованию
             </button>
           ) : (
-            <div className="waiting">● Ведущий управляет раундом</div>
+            <div className="waiting">Ждём ведущего…</div>
           )}
         </section>
       )}
 
-      {/* =================================================
-          VOTING
-      ================================================= */}
+      {/* =================================
+          VOTE
+      ================================= */}
 
       {view === "vote" && (
         <section className="card">
-          <div className="eyebrow">PHASE 03 · VOTING</div>
+          <span className="eyebrow">ГОЛОСОВАНИЕ</span>
 
-          <h2>
-            Кто
-            <br />
-            шпион?
-          </h2>
+          <h2>Кто шпион?</h2>
 
-          <p>Выбери одного игрока. После голосования изменить выбор нельзя.</p>
+          <p>Выбери одного игрока, которого считаешь шпионом.</p>
 
           <div className="voteList">
-            {players.map((player, index) => (
-              <button
-                className={
-                  "vote " + (selected === player.uid ? "selected" : "")
-                }
-                key={player.uid}
-                onClick={() => setSelected(player.uid)}
-              >
-                <span
-                  style={{
-                    color: "#555762",
-                    marginRight: 12,
-                    fontSize: 9,
-                  }}
+            {players
+              .filter((player) => player.uid !== me.uid)
+              .map((player) => (
+                <button
+                  className={
+                    "vote " + (selected === player.uid ? "selected" : "")
+                  }
+                  key={player.uid}
+                  onClick={() => !hasVoted && setSelected(player.uid)}
+                  disabled={hasVoted}
                 >
-                  {String(index + 1).padStart(2, "0")}
-                </span>
-                👤 {player.name}
-              </button>
-            ))}
+                  👤 {player.name}
+                </button>
+              ))}
           </div>
 
-          <button className="primary full" disabled={!selected} onClick={vote}>
-            {selected ? "Подтвердить голос →" : "Выбери игрока"}
+          <button
+            className="primary full"
+            disabled={!selected || hasVoted || loading}
+            onClick={vote}
+          >
+            {hasVoted
+              ? "✓ Ты проголосовал"
+              : loading
+                ? "Отправка..."
+                : "Проголосовать"}
           </button>
 
-          <small>Результат появится после голосов всех игроков.</small>
+          <small>
+            {hasVoted
+              ? "Ждём остальных игроков."
+              : "Результат появится, когда проголосуют все."}
+          </small>
         </section>
       )}
 
-      {/* =================================================
-          RESULT
-      ================================================= */}
+      {/* =================================
+          RESULTS
+      ================================= */}
 
       {view === "result" && (
         <section className="card center">
-          <div className="eyebrow">
-            ROUND {String(room?.round || 1).padStart(2, "0")}
+          <span className="eyebrow">
+            РАУНД {room?.round}
             {" · "}
-            RESULTS
-          </div>
+            РЕЗУЛЬТАТ
+          </span>
 
           <div className="big">{room?.caught ? "🎯" : "🕵️"}</div>
 
-          <h2>
-            {room?.caught ? (
-              <>
-                Шпион
-                <br />
-                найден.
-              </>
-            ) : (
-              <>
-                Шпион
-                <br />
-                сбежал.
-              </>
-            )}
-          </h2>
+          <h2>{room?.caught ? "Шпион найден!" : "Шпион не найден!"}</h2>
 
           <p>
             {room?.caught
-              ? "Большинство правильно вычислило шпиона."
-              : "Голосование прошло мимо цели. Шпион получает преимущество."}
+              ? "Мирные игроки смогли вычислить шпиона."
+              : "Шпион смог запутать игроков и остался незамеченным."}
           </p>
+
+          {/* ANSWER */}
+
+          <div className="result-answer">
+            <span>
+              {room?.roundType === "item"
+                ? "🎒 Был предмет"
+                : "📍 Была локация"}
+            </span>
+
+            <strong>{room?.answer}</strong>
+          </div>
 
           <div className="scoreboard">
             {[...players]
@@ -767,16 +1033,7 @@ export default function App() {
               .map((player, index) => (
                 <div key={player.uid}>
                   <span>
-                    <span
-                      style={{
-                        color: "#555762",
-                        marginRight: 8,
-                      }}
-                    >
-                      {String(index + 1).padStart(2, "0")}
-                    </span>
-
-                    {player.name}
+                    {index + 1}. {player.name}
                   </span>
 
                   <b>{player.score || 0}</b>
@@ -784,32 +1041,30 @@ export default function App() {
               ))}
           </div>
 
-          {host ? (
+          {host && (
             <button className="primary full" onClick={nextRound}>
               Следующий раунд →
             </button>
-          ) : (
-            <div className="waiting">● Ждём ведущего</div>
           )}
         </section>
       )}
 
-      {/* =================================================
+      {/* =================================
           LEAVE
-      ================================================= */}
+      ================================= */}
 
       {me.roomId && (
         <button className="leave" onClick={leave}>
-          EXIT GAME
+          Выйти из комнаты
         </button>
       )}
     </div>
   );
 }
 
-/* =========================================================
-   FIREBASE SETUP
-========================================================= */
+// ========================================
+// FIREBASE SETUP
+// ========================================
 
 function Setup() {
   return (
@@ -819,15 +1074,14 @@ function Setup() {
       </header>
 
       <section className="card">
-        <div className="eyebrow">SYSTEM SETUP</div>
+        <span className="eyebrow">НАСТРОЙКА</span>
 
-        <h2>
-          Firebase
-          <br />
-          required.
-        </h2>
+        <h2>Подключи Firebase</h2>
 
-        <p>Подключи Firebase, чтобы запустить realtime-игру.</p>
+        <p>
+          Скопируй <b>.env.example</b> в <b>.env.local</b> и вставь настройки
+          Firebase.
+        </p>
 
         <pre>
           {`npm install
